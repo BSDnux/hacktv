@@ -58,14 +58,17 @@
 #include "keyboard.h"
 #ifdef WIN32
 #include <conio.h>
+#else
+#include <unistd.h>
 #endif
 
 /* Maximum length of the packet queue */
 /* Taken from ffplay.c */
 #define MAX_QUEUE_SIZE (15 * 1024 * 1024)
+
+/* Seek step in seconds */
 #define AVSEEK_FWD 60
 #define AVSEEK_RWD -60
-#define AVSEEK_SEEKING 1
 
 typedef struct __packet_queue_item_t {
 	
@@ -80,6 +83,7 @@ typedef struct {
 	int size;       /* Number of bytes used */
 	int eof;        /* End of stream / file flag */
 	int abort;      /* Abort flag */
+	int serial;     /* Incremented each time the queue is flushed by a seek */
 	
 	/* Pointers to the first and last packets in the queue */
 	_packet_queue_item_t *first;
@@ -111,7 +115,15 @@ typedef struct {
 	uint32_t *video;
 	uint8_t paused;
 	time_t last_paused;
+	time_t last_seek;
+	int seek_icon;
+	int16_t *silence;
 	av_t *av;
+	
+	/* Seek requests, handled by the input thread */
+	volatile int seek_req;
+	int64_t seek_target;    /* Requested position, AV_TIME_BASE units */
+	int64_t seek_pos;       /* Position of the last completed seek, AV_TIME_BASE units */
 	
 	AVFormatContext *format_ctx;
 	
@@ -186,6 +198,11 @@ typedef struct {
 
 	/* Media icons */
 	image_t *media_icons[4];
+
+	/* On-screen display drawn with the media icons */
+	av_font_t *osd_font;
+	uint32_t *osd_buffer;
+	size_t osd_buffer_size;
 } av_ffmpeg_t;
 
 static void _print_ffmpeg_error(int r)
@@ -216,6 +233,14 @@ void _audio_offset(uint8_t const **dst, uint8_t const * const *src, int offset, 
 	}
 }
 
+static void _format_timestamp(char *buf, size_t size, int64_t t)
+{
+	/* t is in AV_TIME_BASE units */
+	int sec = (t == AV_NOPTS_VALUE || t < 0) ? 0 : t / AV_TIME_BASE;
+
+	snprintf(buf, size, "%02d:%02d:%02d", sec / 3600, (sec / 60) % 60, sec % 60);
+}
+
 static int _packet_queue_init(av_ffmpeg_t *s, _packet_queue_t *q)
 {
 	q->length = 0;
@@ -232,17 +257,24 @@ static int _packet_queue_flush(av_ffmpeg_t *s, _packet_queue_t *q)
 	
 	pthread_mutex_lock(&s->mutex);
 	
-	while(q->length--)
+	while(q->length > 0)
 	{
 		/* Pop the first item off the list */
 		p = q->first;
 		q->first = p->next;
+		q->length--;
 		
 		av_packet_unref(&p->pkt);
 		free(p);
 	}
 	
-	pthread_cond_signal(&s->cond);
+	q->first = NULL;
+	q->last = NULL;
+	q->size = 0;
+	q->eof = 0;
+	q->serial++;
+	
+	pthread_cond_broadcast(&s->cond);
 	pthread_mutex_unlock(&s->mutex);
 	
 	return(0);
@@ -259,7 +291,7 @@ static void _packet_queue_abort(av_ffmpeg_t *s, _packet_queue_t *q)
 	
 	q->abort = 1;
 	
-	pthread_cond_signal(&s->cond);
+	pthread_cond_broadcast(&s->cond);
 	pthread_mutex_unlock(&s->mutex);
 }
 
@@ -277,21 +309,32 @@ static int _packet_queue_write(av_ffmpeg_t *s, _packet_queue_t *q, AVPacket *pkt
 	else
 	{
 		/* Limit the size of the queue */
-		while(q->abort == 0 && q->size + pkt->size + sizeof(_packet_queue_item_t) > MAX_QUEUE_SIZE)
+		while(q->abort == 0 && s->seek_req == 0 && q->size + pkt->size + sizeof(_packet_queue_item_t) > MAX_QUEUE_SIZE)
 		{
 			s->input_stall = 1;
-			pthread_cond_signal(&s->cond);
+			pthread_cond_broadcast(&s->cond);
 			pthread_cond_wait(&s->cond, &s->mutex);
 		}
 		
 		s->input_stall = 0;
+		
+		if(s->seek_req)
+		{
+			/* A seek is pending, this packet would be flushed anyway */
+			av_packet_unref(pkt);
+			
+			pthread_cond_broadcast(&s->cond);
+			pthread_mutex_unlock(&s->mutex);
+			
+			return(0);
+		}
 		
 		if(q->abort == 1)
 		{
 			/* Abort was called while waiting for the queue size to drop */
 			av_packet_unref(pkt);
 			
-			pthread_cond_signal(&s->cond);
+			pthread_cond_broadcast(&s->cond);
 			pthread_mutex_unlock(&s->mutex);
 			
 			return(-2);
@@ -304,7 +347,7 @@ static int _packet_queue_write(av_ffmpeg_t *s, _packet_queue_t *q, AVPacket *pkt
 			/* Out of memory */
 			av_packet_unref(pkt);
 			
-			pthread_cond_signal(&s->cond);
+			pthread_cond_broadcast(&s->cond);
 			pthread_mutex_unlock(&s->mutex);
 			
 			return(-1);
@@ -328,13 +371,13 @@ static int _packet_queue_write(av_ffmpeg_t *s, _packet_queue_t *q, AVPacket *pkt
 		q->size += pkt->size + sizeof(_packet_queue_item_t);
 	}
 	
-	pthread_cond_signal(&s->cond);
+	pthread_cond_broadcast(&s->cond);
 	pthread_mutex_unlock(&s->mutex);
 	
 	return(0);
 }
 
-static int _packet_queue_read(av_ffmpeg_t *s, _packet_queue_t *q, AVPacket *pkt)
+static int _packet_queue_read(av_ffmpeg_t *s, _packet_queue_t *q, AVPacket *pkt, int *serial)
 {
 	_packet_queue_item_t *p;
 	
@@ -342,6 +385,8 @@ static int _packet_queue_read(av_ffmpeg_t *s, _packet_queue_t *q, AVPacket *pkt)
 	
 	while(q->length == 0)
 	{
+		*serial = q->serial;
+		
 		if(s->input_stall)
 		{
 			pthread_mutex_unlock(&s->mutex);
@@ -357,6 +402,8 @@ static int _packet_queue_read(av_ffmpeg_t *s, _packet_queue_t *q, AVPacket *pkt)
 		pthread_cond_wait(&s->cond, &s->mutex);
 	}
 	
+	/* Packets in the queue always belong to the current serial */
+	*serial = q->serial;
 	p = q->first;
 	
 	*pkt = p->pkt;
@@ -366,7 +413,7 @@ static int _packet_queue_read(av_ffmpeg_t *s, _packet_queue_t *q, AVPacket *pkt)
 	
 	free(p);
 	
-	pthread_cond_signal(&s->cond);
+	pthread_cond_broadcast(&s->cond);
 	pthread_mutex_unlock(&s->mutex);
 	
 	return(0);
@@ -485,6 +532,43 @@ static AVFrame *_frame_dbuffer_flip(_frame_dbuffer_t *d)
 	return(frame);
 }
 
+static void _input_seek(av_ffmpeg_t *s)
+{
+	int64_t target;
+	int r;
+	
+	pthread_mutex_lock(&s->mutex);
+	target = s->seek_target;
+	pthread_mutex_unlock(&s->mutex);
+	
+	/* Land on a keyframe at or before the target. The scaler threads
+	 * drop anything decoded before the target, so this is frame accurate
+	 * and never leaves a gap that would freeze the picture */
+	r = avformat_seek_file(s->format_ctx, -1, INT64_MIN, target, target, 0);
+	
+	if(r < 0)
+	{
+		fprintf(stderr, "\nSeek failed: ");
+		_print_ffmpeg_error(r);
+	}
+	else
+	{
+		/* Must be set before the flush, the scalers read it when they see the new serial */
+		s->seek_pos = target;
+		
+		_packet_queue_flush(s, &s->video_queue);
+		_packet_queue_flush(s, &s->audio_queue);
+	}
+	
+	pthread_mutex_lock(&s->mutex);
+	
+	/* Another request may have arrived while seeking, only clear it if not */
+	if(s->seek_target == target) s->seek_req = 0;
+	
+	pthread_cond_broadcast(&s->cond);
+	pthread_mutex_unlock(&s->mutex);
+}
+
 static void *_input_thread(void *arg)
 {
 	av_ffmpeg_t *s = (av_ffmpeg_t *) arg;
@@ -496,6 +580,11 @@ static void *_input_thread(void *arg)
 	/* Fetch packets from the source */
 	while(s->thread_abort == 0)
 	{
+		if(s->seek_req)
+		{
+			_input_seek(s);
+		}
+		
 		r = av_read_frame(s->format_ctx, &pkt);
 		
 		if(r == AVERROR(EAGAIN))
@@ -505,8 +594,22 @@ static void *_input_thread(void *arg)
 		}
 		else if(r < 0)
 		{
-			/* FFmpeg input EOF or error. Break out */
-			break;
+			/* FFmpeg input EOF or error. Set the EOF flag in the queues */
+			_packet_queue_write(s, &s->video_queue, NULL);
+			_packet_queue_write(s, &s->audio_queue, NULL);
+			
+			/* The decoders may still be working through queued packets,
+			 * so wait here in case a seek arrives before they finish */
+			pthread_mutex_lock(&s->mutex);
+			
+			while(s->thread_abort == 0 && s->seek_req == 0 && s->video_queue.abort == 0)
+			{
+				pthread_cond_wait(&s->cond, &s->mutex);
+			}
+			
+			pthread_mutex_unlock(&s->mutex);
+			
+			continue;
 		}
 		
 		if(s->video_stream && pkt.stream_index == s->video_stream->index)
@@ -592,7 +695,7 @@ static void *_video_decode_thread(void *arg)
 	av_ffmpeg_t *s = (av_ffmpeg_t *) arg;
 	AVPacket pkt, *ppkt = NULL;
 	AVFrame *frame;
-	int r;
+	int r, serial = 0, pkt_serial;
 	
 	//fprintf(stderr, "_video_decode_thread(): Starting\n");
 	
@@ -603,7 +706,7 @@ static void *_video_decode_thread(void *arg)
 	{
 		if(ppkt == NULL)
 		{
-			r = _packet_queue_read(s, &s->video_queue, &pkt);
+			r = _packet_queue_read(s, &s->video_queue, &pkt, &pkt_serial);
 			if(r == -2)
 			{
 				/* Thread is aborting */
@@ -611,6 +714,13 @@ static void *_video_decode_thread(void *arg)
 			}
 			
 			ppkt = (r >= 0 ? &pkt : NULL);
+			
+			if(pkt_serial != serial)
+			{
+				/* A seek has happened, discard the decoder's buffered frames */
+				avcodec_flush_buffers(s->video_codec_ctx);
+				serial = pkt_serial;
+			}
 		}
 		
 		r = avcodec_send_packet(s->video_codec_ctx, ppkt);
@@ -643,6 +753,9 @@ static void *_video_decode_thread(void *arg)
 				printf( "Error while sourcing the video filtergraph\n");
 			}
 			
+			/* Tag the frame so the scaler can detect a seek */
+			frame->opaque = (void *) (intptr_t) serial;
+			
 			/* We have received a frame! */
 			av_frame_ref(_frame_dbuffer_back_buffer(&s->in_video_buffer), frame);
 			_frame_dbuffer_ready(&s->in_video_buffer, 0);
@@ -670,11 +783,19 @@ static void *_video_scaler_thread(void *arg)
 	AVRational ratio;
 	r64_t r;
 	int64_t pts;
-	int i, j;
+	int i, j, serial = 0;
 	
 	/* Fetch video frames and pass them through the scaler */
 	while((frame = _frame_dbuffer_flip(&s->in_video_buffer)) != NULL)
 	{
+		if((int) (intptr_t) frame->opaque != serial)
+		{
+			/* First frame after a seek. Move the video clock to the seek
+			 * target, frames before it are dropped by the code below */
+			serial = (int) (intptr_t) frame->opaque;
+			s->video_start_time = av_rescale_q(s->seek_pos, AV_TIME_BASE_Q, s->video_time_base);
+		}
+		
 		pts = frame->best_effort_timestamp;
 		
 		/* Extract EIA-608 caption codes from the frame */
@@ -788,24 +909,21 @@ static void *_video_scaler_thread(void *arg)
 			INT_MAX
 		);
 
+		/* Keep the frame's position with the scaled frame, for the on-screen display */
+		oframe->pts = frame->best_effort_timestamp == AV_NOPTS_VALUE ? AV_NOPTS_VALUE :
+			av_rescale_q(frame->best_effort_timestamp, s->video_stream->time_base, AV_TIME_BASE_Q);
+
 		/* I don't like these routines here but it doesn't do any harm (I think) */
 		/* Print timestamp of the video to console */
-		int sec, hr, min, pts;
-		pts = (frame->best_effort_timestamp / (s->video_stream->time_base.den / s->video_stream->time_base.num));
-		hr  = (pts / 3600);
-		min = (pts - (3600 * hr)) / 60;
-		sec = (pts - (3600 * hr) - (min * 60));
+		char timestamp[16];
+		_format_timestamp(timestamp, sizeof(timestamp), oframe->pts);
 
-		fprintf(stderr,"\r%02d:%02d:%02d", hr, min, sec);
+		fprintf(stderr,"\r%s", timestamp);
 
 		/* Overlay timestamp to video frame, if enabled */
 		if(s->font[TEXT_TIMESTAMP])
 		{
-			asprintf(&s->font[TEXT_TIMESTAMP]->text, "%02d:%02d:%02d", hr, min, sec);
-			print_generic_text(s->font[TEXT_TIMESTAMP], (uint32_t *) oframe->data[0], oframe->linesize[0] / sizeof(uint32_t), s->font[TEXT_TIMESTAMP]->text, 10, 90, TEXT_SHADOW, NO_TEXT_BOX, 0, 0);
-
-			/* Free memory */
-			free(s->font[TEXT_TIMESTAMP]->text);
+			print_generic_text(s->font[TEXT_TIMESTAMP], (uint32_t *) oframe->data[0], oframe->linesize[0] / sizeof(uint32_t), timestamp, 10, 90, TEXT_SHADOW, NO_TEXT_BOX, 0, 0);
 		}
 
 		/* Print logo, if enabled */
@@ -867,13 +985,89 @@ static void *_video_scaler_thread(void *arg)
 	return(NULL);
 }
 
+static void _request_seek(av_ffmpeg_t *s, int seconds)
+{
+	int64_t pos, start;
+	
+	pthread_mutex_lock(&s->mutex);
+	
+	if(s->seek_req)
+	{
+		/* Stack up repeated key presses */
+		pos = s->seek_target;
+	}
+	else
+	{
+		/* Current playback position */
+		pos = av_rescale_q(s->video_start_time, s->video_time_base, AV_TIME_BASE_Q);
+	}
+	
+	pos += (int64_t) seconds * AV_TIME_BASE;
+	
+	start = s->format_ctx->start_time != AV_NOPTS_VALUE ? s->format_ctx->start_time : 0;
+	if(pos < start) pos = start;
+	
+	s->seek_target = pos;
+	s->seek_req = 1;
+	
+	/* Wake the input thread if it's waiting on a full queue or at EOF */
+	pthread_cond_broadcast(&s->cond);
+	pthread_mutex_unlock(&s->mutex);
+}
+
+#ifndef WIN32
+static int _kb_getc(void)
+{
+	/* Bypass stdio buffering so kbhit() still sees the rest of an escape sequence */
+	unsigned char ch;
+	return(read(0, &ch, 1) == 1 ? ch : -1);
+}
+#endif
+
+static uint32_t *_draw_osd(av_ffmpeg_t *s, AVFrame *avframe, image_t *icon, int64_t t)
+{
+	size_t size = avframe->linesize[0] * avframe->height;
+	int stride = avframe->linesize[0] / sizeof(uint32_t);
+	char timestamp[16];
+	float y;
+
+	/* Draw on a copy, leaving the frame untouched. Paused and repeated frames
+	 * are returned more than once, and the icon's transparency would build up */
+	if(size > s->osd_buffer_size)
+	{
+		free(s->osd_buffer);
+		s->osd_buffer = malloc(size);
+		s->osd_buffer_size = s->osd_buffer ? size : 0;
+
+		if(!s->osd_buffer)
+		{
+			return((uint32_t *) avframe->data[0]);
+		}
+	}
+
+	memcpy(s->osd_buffer, avframe->data[0], size);
+
+	overlay_image(s->osd_buffer, icon, avframe->width, stride, avframe->height, IMG_POS_MIDDLE);
+
+	if(s->osd_font)
+	{
+		/* Text baseline roughly one line below the bottom of the icon */
+		y = (avframe->height * 0.5 + icon->img_height * 0.5 + s->osd_font->font_size) * 100.0 / s->osd_font->video_height;
+
+		_format_timestamp(timestamp, sizeof(timestamp), t);
+		print_generic_text(s->osd_font, s->osd_buffer, stride, timestamp, 50, y, TEXT_SHADOW, NO_TEXT_BOX, 0, 0);
+	}
+
+	return(s->osd_buffer);
+}
+
 static int _ffmpeg_read_video(void *ctx, av_frame_t *frame)
 {
 	av_ffmpeg_t *s = ctx;
 	AVFrame *avframe;
-		
-	// int nav;
-	// nav = 0;
+	image_t *icon = NULL;
+	int64_t osd_time = AV_NOPTS_VALUE;
+	uint32_t *framebuffer;
 
 	av_frame_init(frame, 0, 0, NULL, 0, 0);
 
@@ -886,9 +1080,9 @@ static int _ffmpeg_read_video(void *ctx, av_frame_t *frame)
 	if(kbhit())
 	{
 		#ifndef WIN32
-		char c = getchar();
+		int c = _kb_getc();
 		#else
-		char c = getch();
+		int c = getch();
 		#endif
 		switch(c)
 		{
@@ -896,66 +1090,82 @@ static int _ffmpeg_read_video(void *ctx, av_frame_t *frame)
 				s->paused ^= 1;
 				fprintf(stderr,"\nVideo state: %s", s->paused ? "PAUSE" : "PLAY");	
 				break;
-/*			case '\033':
-				#ifndef WIN32
-				getchar();
-				c = getchar();
-				#else
+			#ifndef WIN32
+			/* Arrow keys are sent as ESC [ C / ESC [ D. The whole sequence
+			 * arrives at once, so don't block if a lone ESC was pressed */
+			case '\033':
+				if(!kbhit() || _kb_getc() != '[' || !kbhit()) break;
+				c = _kb_getc();
+			#else
+			/* Arrow keys are sent as 0xE0 (or 0) followed by M / K */
+			case 0x00:
+			case 0xE0:
 				c = getch();
-				#endif
+				c = c == 'M' ? 'C' : c == 'K' ? 'D' : 0;
+			#endif
+				/* No seeking while paused. The key sequence is consumed above
+				 * so its leftover bytes aren't read as separate key presses */
+				if(s->paused) break;
+
 				switch(c)
 				{
 					case 'C':
-						fprintf(stderr,"\nVideo state: FF");
-						nav = AVSEEK_FWD;
+						fprintf(stderr,"\nVideo state: FF %ds", AVSEEK_FWD);
+						_request_seek(s, AVSEEK_FWD);
+						s->seek_icon = 2;
+						s->last_seek = time(0);
 						break;
 					case 'D':
-						fprintf(stderr,"\nVideo state: RW");
-						nav = AVSEEK_RWD;
+						fprintf(stderr,"\nVideo state: RW %ds", -AVSEEK_RWD);
+						_request_seek(s, AVSEEK_RWD);
+						s->seek_icon = 3;
+						s->last_seek = time(0);
 						break;
 					default:
 						break;
 				}
 				break;
-*/
 			default: 
 				break;
 		}
 	}
 	kb_disable();
 
-/*
-	if(nav == AVSEEK_FWD || nav == AVSEEK_RWD)
+	if(s->paused)
 	{
-		s->video_start_time += nav;
-		s->audio_start_time += nav;
-		nav = 0;
-	}
-*/	
-	if(s->paused) 
-	{
+		/* Show 'pause' icon and the paused position */
 		avframe = s->out_video_buffer.frame[0];
-		
-		overlay_image((uint32_t *) avframe->data[0], s->media_icons[1], avframe->width, avframe->linesize[0] / sizeof(uint32_t), avframe->height, IMG_POS_MIDDLE);
+		icon = s->media_icons[1];
+		osd_time = avframe->pts;
 		s->last_paused = time(0);
 	}
 	else
 	{
 		avframe = _frame_dbuffer_flip(&s->out_video_buffer);
-		/* Show 'play' icon for 5 seconds after resuming play */
-		if(time(0) - s->last_paused < 5)
+
+		if(!avframe)
 		{
-			overlay_image((uint32_t *) avframe->data[0], s->media_icons[0], avframe->width, avframe->linesize[0] / sizeof(uint32_t), avframe->height, IMG_POS_MIDDLE);
+			/* EOF or abort */
+			s->video_eof = 1;
+			return(AV_EOF);
+		}
+
+		if(time(0) - s->last_seek < 3)
+		{
+			/* Show 'ff' or 'rw' icon and the new position for 3 seconds after seeking */
+			icon = s->media_icons[s->seek_icon];
+			osd_time = s->seek_target;
+		}
+		else if(time(0) - s->last_paused < 5)
+		{
+			/* Show 'play' icon and the current position for 5 seconds after resuming play */
+			icon = s->media_icons[0];
+			osd_time = avframe->pts;
 		}
 	}
 
-	if(!avframe)
-	{
-		/* EOF or abort */
-		s->video_eof = 1;
-		return(AV_EOF);
-	}
-	
+	framebuffer = icon ? _draw_osd(s, avframe, icon, osd_time) : (uint32_t *) avframe->data[0];
+
 	/* Return image ratio */
 	if(avframe->sample_aspect_ratio.num > 0 &&
 	   avframe->sample_aspect_ratio.den > 0)
@@ -985,7 +1195,7 @@ static int _ffmpeg_read_video(void *ctx, av_frame_t *frame)
 	/* Set the pointer to the framebuffer */
 	frame->width = avframe->width;
 	frame->height = avframe->height;
-	frame->framebuffer = (uint32_t *) avframe->data[0];
+	frame->framebuffer = framebuffer;
 	frame->pixel_stride = 1;
 	frame->line_stride = avframe->linesize[0] / sizeof(uint32_t);
 
@@ -999,7 +1209,7 @@ static void *_audio_decode_thread(void *arg)
 	av_ffmpeg_t *s = (av_ffmpeg_t *) arg;
 	AVPacket pkt, *ppkt = NULL;
 	AVFrame *frame;
-	int r;
+	int r, serial = 0, pkt_serial;
 	
 	//fprintf(stderr, "_audio_decode_thread(): Starting\n");
 	
@@ -1010,7 +1220,7 @@ static void *_audio_decode_thread(void *arg)
 	{
 		if(ppkt == NULL)
 		{
-			r = _packet_queue_read(s, &s->audio_queue, &pkt);
+			r = _packet_queue_read(s, &s->audio_queue, &pkt, &pkt_serial);
 			if(r == -2)
 			{
 				/* Thread is aborting */
@@ -1018,6 +1228,13 @@ static void *_audio_decode_thread(void *arg)
 			}
 			
 			ppkt = (r >= 0 ? &pkt : NULL);
+			
+			if(pkt_serial != serial)
+			{
+				/* A seek has happened, discard the decoder's buffered frames */
+				avcodec_flush_buffers(s->audio_codec_ctx);
+				serial = pkt_serial;
+			}
 		}
 		
 		r = avcodec_send_packet(s->audio_codec_ctx, ppkt);
@@ -1043,6 +1260,9 @@ static void *_audio_decode_thread(void *arg)
 			{
 				fprintf(stderr, "Error while sourcing the audio filtergraph\n");
 			}
+			
+			/* Tag the frame so the resampler can detect a seek */
+			frame->opaque = (void *) (intptr_t) serial;
 			
 			/* We have received a frame! */
 			av_frame_ref(_frame_dbuffer_back_buffer(&s->in_audio_buffer), frame);
@@ -1070,13 +1290,22 @@ static void *_audio_scaler_thread(void *arg)
 	AVFrame *frame, *oframe;
 	int64_t pts, next_pts;
 	uint8_t const *data[AV_NUM_DATA_POINTERS];
-	int r, count, drop;
+	int r, count, drop, serial = 0;
 	
 	//fprintf(stderr, "_audio_scaler_thread(): Starting\n");
 	
 	/* Fetch audio frames and pass them through the resampler */
 	while((frame = _frame_dbuffer_flip(&s->in_audio_buffer)) != NULL)
 	{
+		if((int) (intptr_t) frame->opaque != serial)
+		{
+			/* First frame after a seek. Move the audio clock to the same
+			 * target as the video, and drop samples buffered in the resampler */
+			serial = (int) (intptr_t) frame->opaque;
+			s->audio_start_time = av_rescale_q(s->seek_pos, AV_TIME_BASE_Q, s->audio_time_base);
+			swr_init(s->swr_ctx);
+		}
+		
 		pts = frame->best_effort_timestamp;
 		drop = 0;
 		
@@ -1164,9 +1393,17 @@ static int _ffmpeg_read_audio(void *ctx, int16_t **samples, size_t *nsamples)
 	av_ffmpeg_t *s = ctx;
 	AVFrame *frame;
 	
-	if(s->audio_stream == NULL || s->paused)
+	if(s->audio_stream == NULL)
 	{
 		return(AV_EOF);
+	}
+	
+	if(s->paused) 
+	{
+		/* Returning AV_EOF here would make av_read_audio() disable audio for good */
+		*samples = s->silence;
+		*nsamples = s->out_frame_size;
+		return(AV_OK);
 	}
 	
 	frame = _frame_dbuffer_flip(&s->out_audio_buffer);
@@ -1229,7 +1466,10 @@ static int _ffmpeg_close(void *ctx)
 		
 		avcodec_free_context(&s->audio_codec_ctx);
 		swr_free(&s->swr_ctx);
+		free(s->silence);
 	}
+
+	free(s->osd_buffer);
 	
 	avformat_close_input(&s->format_ctx);
 	
@@ -1818,7 +2058,14 @@ int av_ffmpeg_open(vid_t *vid, void *ctx, char *input_url, char *format, char *o
 		
 		s->font[TEXT_TIMESTAMP] = av->av_font;
 	}
-	
+
+	/* Font for the position shown under the media icons. This can't share the
+	 * timestamp font, the video scaler thread draws with that one at the same time */
+	if(font_init(av, 40, source_ratio, conf) == VID_OK)
+	{
+		s->osd_font = av->av_font;
+	}
+
 	/* Calculate ratio */
 	float ratio = conf->pillarbox || conf->letterbox ? (4.0 / 3.0 ): ws ? (16.0 / 9.0) : (4.0 / 3.0);
 
@@ -1838,6 +2085,18 @@ int av_ffmpeg_open(vid_t *vid, void *ctx, char *input_url, char *format, char *o
 	}
 	
 	if(load_png(&s->media_icons[1], av->width, av->height, "pause", 1, ratio, IMG_MEDIA) != HACKTV_OK)
+	{
+		fprintf(stderr, "Error loading media icons.\n");
+		return(HACKTV_ERROR);
+	}
+
+	if(load_png(&s->media_icons[2], av->width, av->height, "ff", 1, ratio, IMG_MEDIA) != HACKTV_OK)
+	{
+		fprintf(stderr, "Error loading media icons.\n");
+		return(HACKTV_ERROR);
+	}
+
+	if(load_png(&s->media_icons[3], av->width, av->height, "rw", 1, ratio, IMG_MEDIA) != HACKTV_OK)
 	{
 		fprintf(stderr, "Error loading media icons.\n");
 		return(HACKTV_ERROR);
@@ -1917,6 +2176,13 @@ int av_ffmpeg_open(vid_t *vid, void *ctx, char *input_url, char *format, char *o
 		if(s->out_frame_size <= 0)
 		{
 			s->out_frame_size = av->sample_rate.num / av->sample_rate.den;
+		}
+		
+		/* Stereo silence, played while paused */
+		s->silence = calloc(s->out_frame_size * 2, sizeof(int16_t));
+		if(!s->silence)
+		{
+			return(AV_OUT_OF_MEMORY);
 		}
 		
 		/* Calculate the allowed error in input samples, +/- 20ms */

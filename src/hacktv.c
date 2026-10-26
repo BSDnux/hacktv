@@ -148,6 +148,7 @@ static void print_usage(void)
 		"\n"
 		"  test:colourbars    Generate and transmit a test pattern.\n"
 		"  test:pm5544        Transmit a PM5544 test pattern.\n"
+		"  test:pm5644        Transmit a PM5644 (16:9) test pattern.\n"
 		"  test:ueitm         Transmit a UEITM test pattern.\n"
 		"  test:fubk          Transmit a FUBK test pattern.\n"
 		"  ffmpeg:<file|url>  Decode and transmit a video file with ffmpeg.\n"
@@ -1831,7 +1832,7 @@ int main(int argc, char *argv[])
 			
 			if(strncmp(pre, "test", l) == 0)
 			{
-				r = av_test_open(&s.vid.av, sub, &s.vid.conf);
+				r = av_test_open(&s.vid, sub);
 			}
 			else if(strncmp(pre, "ffmpeg", l) == 0)
 			{

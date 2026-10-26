@@ -31,6 +31,7 @@ OBJS    := acp.o \
            syster.o \
            syster-ca.o \
            teletext.o \
+           testcard.o \
            vbidata.o \
            video.o \
            videocrypt.o \
